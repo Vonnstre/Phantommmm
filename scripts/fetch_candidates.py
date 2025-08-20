@@ -1,7 +1,3 @@
----
-
-### `scripts/fetch_candidates.py`
-```python
 #!/usr/bin/env python3
 import asyncio
 import aiohttp
@@ -313,4 +309,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main(
+    main()
