@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
+"""
+merge_deep_with_raw.py
+Join deep CSV back into raw CSV producing merged outputs.
+"""
+
 import csv
 import os
 import argparse
+import sys
 
 def main():
     ap = argparse.ArgumentParser()
