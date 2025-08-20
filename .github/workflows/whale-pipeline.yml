@@ -48,17 +48,18 @@ jobs:
       - name: Fast pass - candidates
         env:
           ETH_USD: ${{ inputs.eth_usd }}
+          PYTHONUNBUFFERED: '1'
         run: |
           mkdir -p outputs
           if [ -z "$ETH_USD" ]; then
-            python scripts/fetch_candidates.py \
+            python -u scripts/fetch_candidates.py \
               --limit ${{ inputs.limit }} \
               --usd_threshold ${{ inputs.usd_threshold }} \
               --concurrency ${{ inputs.concurrency_fast }} \
               --out outputs/whale_candidates_raw.csv \
               --fast
           else
-            python scripts/fetch_candidates.py \
+            python -u scripts/fetch_candidates.py \
               --limit ${{ inputs.limit }} \
               --usd_threshold ${{ inputs.usd_threshold }} \
               --concurrency ${{ inputs.concurrency_fast }} \
@@ -77,12 +78,12 @@ jobs:
           ETH_USD: ${{ inputs.eth_usd }}
         run: |
           if [ -z "$ETH_USD" ]; then
-            python scripts/deep_enrich_top.py \
+            python -u scripts/deep_enrich_top.py \
               --top_file outputs/top500_for_deep.txt \
               --out outputs/whale_candidates_deep.csv \
               --concurrency ${{ inputs.concurrency_deep }}
           else
-            python scripts/deep_enrich_top.py \
+            python -u scripts/deep_enrich_top.py \
               --top_file outputs/top500_for_deep.txt \
               --out outputs/whale_candidates_deep.csv \
               --concurrency ${{ inputs.concurrency_deep }} \
