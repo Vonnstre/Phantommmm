@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
+"""
+deep_enrich_top.py
+Deep-enrich the top addresses listed in top500_for_deep.txt using Ethplorer freekey.
+"""
+
 import asyncio
 import aiohttp
 import argparse
 import csv
 import os
+import sys
+from datetime import datetime
 
 ETHPLORER_ENDPOINT = "https://api.ethplorer.io/getAddressInfo/{}?apiKey=freekey"
 COINGECKO_SIMPLE = "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd"
@@ -14,10 +21,10 @@ async def fetch_json(session, url, retries=4, backoff=0.8):
             async with session.get(url, timeout=30) as r:
                 if r.status == 200:
                     return await r.json()
-                else:
-                    await asyncio.sleep(backoff * (2**i))
+                # backoff on non-200
+                await asyncio.sleep(backoff * (2 ** i))
         except Exception:
-            await asyncio.sleep(backoff * (2**i))
+            await asyncio.sleep(backoff * (2 ** i))
     return None
 
 async def enrich_address(session, addr, eth_usd):
@@ -75,6 +82,7 @@ async def run_all(eth_usd, concurrency, top_file, out_path):
                     results.append(r)
 
         tasks = [worker(a) for a in addrs]
+        print(f"DEEP: launching {len(tasks)} tasks with concurrency={concurrency}")
         await asyncio.gather(*tasks)
 
     with open(out_path, 'w', newline='') as f:
