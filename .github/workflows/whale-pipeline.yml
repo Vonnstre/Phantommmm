@@ -1,0 +1,105 @@
+name: Whales Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Number of addresses to consider (fast pass)"
+        required: true
+        default: "3000"
+      usd_threshold:
+        description: "Filter wallets by min USD value"
+        required: true
+        default: "10000"
+      eth_usd:
+        description: "Override ETH/USD (blank = fetch from Coingecko)"
+        required: false
+        default: ""
+      concurrency_fast:
+        description: "Concurrency for fast pass"
+        required: true
+        default: "8"
+      run_deep:
+        description: "Run deep-enrichment on top 500? (true/false)"
+        required: true
+        default: "true"
+      concurrency_deep:
+        description: "Concurrency for deep pass"
+        required: true
+        default: "4"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Fast pass - candidates
+        env:
+          ETH_USD: ${{ inputs.eth_usd }}
+        run: |
+          mkdir -p outputs
+          if [ -z "$ETH_USD" ]; then
+            python scripts/fetch_candidates.py \
+              --limit ${{ inputs.limit }} \
+              --usd_threshold ${{ inputs.usd_threshold }} \
+              --concurrency ${{ inputs.concurrency_fast }} \
+              --out outputs/whale_candidates_raw.csv \
+              --fast
+          else
+            python scripts/fetch_candidates.py \
+              --limit ${{ inputs.limit }} \
+              --usd_threshold ${{ inputs.usd_threshold }} \
+              --concurrency ${{ inputs.concurrency_fast }} \
+              --out outputs/whale_candidates_raw.csv \
+              --eth_usd "$ETH_USD" \
+              --fast
+          fi
+
+      - name: Finalize (first pass)
+        run: |
+          python scripts/finalize_sqlite.py --raw outputs/whale_candidates_raw.csv --base outputs
+
+      - name: Deep enrich top 500
+        if: ${{ inputs.run_deep == 'true' }}
+        env:
+          ETH_USD: ${{ inputs.eth_usd }}
+        run: |
+          if [ -z "$ETH_USD" ]; then
+            python scripts/deep_enrich_top.py \
+              --top_file outputs/top500_for_deep.txt \
+              --out outputs/whale_candidates_deep.csv \
+              --concurrency ${{ inputs.concurrency_deep }}
+          else
+            python scripts/deep_enrich_top.py \
+              --top_file outputs/top500_for_deep.txt \
+              --out outputs/whale_candidates_deep.csv \
+              --concurrency ${{ inputs.concurrency_deep }} \
+              --eth_usd "$ETH_USD"
+          fi
+
+      - name: Merge deep + finalize again
+        if: ${{ inputs.run_deep == 'true' }}
+        run: |
+          python scripts/merge_deep_with_raw.py \
+            --raw outputs/whale_candidates_raw.csv \
+            --deep outputs/whale_candidates_deep.csv \
+            --out outputs/whale_candidates_merged.csv
+          python scripts/finalize_sqlite.py --raw outputs/whale_candidates_merged.csv --base outputs
+
+      - name: Upload outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: whale-candidates-${{ github.run_number }}
+          path: outputs/**
