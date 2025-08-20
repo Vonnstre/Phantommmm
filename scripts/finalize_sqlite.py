@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+"""
+finalize_sqlite.py
+Takes raw CSV (raw or merged), computes final scoring view using in-memory sqlite,
+exports final_whales.csv, redacted_top10.csv, top500_for_deep.txt, README.txt and final_package.zip.
+"""
+
 import sqlite3
 import csv
 import os
@@ -6,6 +12,7 @@ import zipfile
 import datetime
 import math
 import argparse
+import sys
 
 def main():
     ap = argparse.ArgumentParser()
@@ -20,12 +27,13 @@ def main():
     README = os.path.join(BASE, "README.txt")
     ZIP = os.path.join(BASE, "final_package.zip")
     TOP_FOR_DEEP = os.path.join(BASE, "top500_for_deep.txt")
-    RUN_ID = "run_" + datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    PRODUCED_AT = datetime.datetime.utcnow().isoformat() + "Z"
+    RUN_ID = "run_" + datetime.datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    PRODUCED_AT = datetime.datetime.datetime.utcnow().isoformat() + "Z"
 
     os.makedirs(BASE, exist_ok=True)
     if not os.path.exists(RAW):
         print("ERROR: raw CSV not found:", RAW)
+        # don't crash with cryptic trace in Actions, exit non-zero so workflow fails predictably
         raise SystemExit(1)
 
     con = sqlite3.connect(":memory:")
@@ -80,7 +88,7 @@ def main():
         cur.executemany("INSERT INTO raw VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
         con.commit()
 
-    # final view with scoring
+    # final view with scoring (reuse same formula as producer)
     cur.execute(f"""
         CREATE VIEW final AS
         SELECT
@@ -165,22 +173,16 @@ Run ID: {RUN_ID}
 Produced At: {PRODUCED_AT}
 
 Files:
-- final_whales.csv : full enriched list ordered by lead_score_candidate
-- redacted_top10.csv : redacted sample for outreach (addresses masked)
-- top500_for_deep.txt : addresses recommended for deep enrichment pass
+ - final_whales.csv : full enriched list ordered by lead_score_candidate
+ - redacted_top10.csv : redacted sample for outreach (addresses masked)
+ - top500_for_deep.txt : addresses recommended for deep enrichment pass
 
-Columns:
-address, eth_balance, eth_usd_value, last_tx_ts, days_since_last_tx, tx_count_30d, tx_count_90d, tx_count_365d,
-token_actions_30d, token_actions_90d, distinct_tokens_ever, recv_from_exchange_count_lookback,
-send_to_exchange_count_lookback, is_contract, total_in_tokens_normalized, total_out_tokens_normalized, top_tokens,
-eth_balance_deep, eth_usd_value_deep, total_token_balance_normalized_deep, top_tokens_deep,
-concentration_score, lead_score_candidate, run_id, produced_at
+Columns: address, eth_balance, eth_usd_value, last_tx_ts, days_since_last_tx, tx_count_30d, tx_count_90d, tx_count_365d, token_actions_30d, token_actions_90d, distinct_tokens_ever, recv_from_exchange_count_lookback, send_to_exchange_count_lookback, is_contract, total_in_tokens_normalized, total_out_tokens_normalized, top_tokens, eth_balance_deep, eth_usd_value_deep, total_token_balance_normalized_deep, top_tokens_deep, concentration_score, lead_score_candidate, run_id, produced_at
 
-Scoring:
-size (log10 USD)*40 + capped activity + recency + exchange recv + net inflow + concentration bias.
+Scoring: size (log10 USD)*40 + capped activity + recency + exchange recv + net inflow + concentration bias.
 
 Notes:
-- Data sourced from public on-chain endpoints (Cloudflare RPC + Ethplorer free key).
+ - Data sourced from public on-chain endpoints (Cloudflare RPC + Ethplorer free key).
 """
     with open(README, 'w') as f:
         f.write(readme)
@@ -193,7 +195,6 @@ Notes:
 
     print("WROTE:", OUT, SAMPLE, TOP_FOR_DEEP, README, ZIP)
     con.close()
-
 
 if __name__ == "__main__":
     main()
