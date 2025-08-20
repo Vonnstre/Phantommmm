@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+"""
+fetch_candidates.py
+Fast pass: scrape Etherscan accounts pages for addresses, call Cloudflare RPC for balances,
+optionally call Ethplorer for per-address enrich. Writes outputs/whale_candidates_raw.csv
+"""
+
 import asyncio
 import aiohttp
 import argparse
@@ -6,6 +12,7 @@ import math
 import time
 import csv
 import os
+import sys
 from datetime import datetime, timedelta
 
 ETHERSCAN_ACCOUNTS_PAGE = "https://etherscan.io/accounts/{}"
@@ -32,13 +39,18 @@ async def fetch_json(session, url, method='GET', json=None, headers=None, timeou
                 async with session.get(url, timeout=timeout, headers=headers) as r:
                     if r.status == 200:
                         return await r.json()
+                    # return None on 4xx/5xx so caller can act
+                    if 400 <= r.status < 500:
+                        return None
             else:
                 async with session.post(url, json=json, timeout=timeout, headers=headers) as r:
                     if r.status == 200:
                         return await r.json()
-        except Exception:
-            pass
-        await asyncio.sleep(backoff * (2 ** attempt) * (0.8 + 0.4 * (attempt % 2)))
+                    if 400 <= r.status < 500:
+                        return None
+        except Exception as e:
+            # transient errors will retry
+            await asyncio.sleep(backoff * (2 ** attempt))
     return None
 
 
@@ -52,11 +64,15 @@ async def scrape_top_addresses(session, limit, concurrency=3):
             try:
                 async with session.get(url, headers=HEADERS, timeout=20) as r:
                     if r.status != 200:
+                        print(f"SCRAPE: page {page} returned status {r.status}, stopping.")
                         break
                     text = await r.text()
-            except Exception:
+            except Exception as e:
+                print(f"SCRAPE: page {page} fetch error: {e}, stopping.")
                 break
+
         idx = 0
+        found_this_page = 0
         while True:
             idx = text.find('/address/', idx)
             if idx == -1:
@@ -66,9 +82,12 @@ async def scrape_top_addresses(session, limit, concurrency=3):
             if addr.startswith('0x') and len(addr) >= 42:
                 addr = addr.split('"')[0].split('<')[0].strip().lower()
                 addresses.append(addr)
+                found_this_page += 1
                 if len(addresses) >= limit:
                     break
             idx += 1
+
+        print(f"SCRAPE: page {page} done, found {found_this_page} addresses (total so far: {len(addresses)})")
         page += 1
         await asyncio.sleep(0.45)
 
@@ -81,6 +100,7 @@ async def scrape_top_addresses(session, limit, concurrency=3):
             out.append(a)
             if len(out) >= limit:
                 break
+    print(f"SCRAPE: finished - returning {len(out)} addresses")
     return out
 
 
@@ -98,10 +118,12 @@ async def get_balance_rpc(session, address):
 
 async def fetch_ethplorer(session, address):
     url = ETHPLORER_ENDPOINT.format(address)
+    # ethplorer can 429: let fetch_json handle retries, caller can backoff if many 429s come back as None
     return await fetch_json(session, url, retries=4, backoff=0.6)
 
 
 async def process_address(session, address, eth_usd, lookback_days, exchange_set, deep=True):
+    # perform both calls concurrently
     tasks = [get_balance_rpc(session, address)]
     if deep:
         tasks.append(fetch_ethplorer(session, address))
@@ -233,7 +255,7 @@ async def run_all(limit, lookback_days, usd_threshold, eth_usd, concurrency, dee
     start = time.time()
     os.makedirs(os.path.dirname(out_file) or ".", exist_ok=True)
     connector = aiohttp.TCPConnector(limit=max(8, concurrency * 2), force_close=True)
-    timeout = aiohttp.ClientTimeout(total=60)
+    timeout = aiohttp.ClientTimeout(total=90)
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         if addresses_file:
             addrs = []
@@ -242,29 +264,44 @@ async def run_all(limit, lookback_days, usd_threshold, eth_usd, concurrency, dee
                     a = line.strip().lower()
                     if a.startswith('0x'):
                         addrs.append(a)
-            print(f"Loaded {len(addrs)} addresses from {addresses_file}")
+            print(f"LOADED: {len(addrs)} addresses from {addresses_file}")
         else:
+            print(f"SCRAPE: starting scrape for limit={limit} concurrency={max(2, concurrency//3)}")
             addrs = await scrape_top_addresses(session, limit, concurrency=max(2, concurrency // 3))
-            print(f"Scraped {len(addrs)} candidate addresses")
+            print(f"SCRAPE: scraped {len(addrs)} candidate addresses")
+
+        if not addrs:
+            print("No candidate addresses scraped; exiting.")
+            return
 
         sem = asyncio.Semaphore(concurrency)
         results = []
         failed = 0
+        processed = 0
+        total = len(addrs)
 
         async def worker(addr):
             async with sem:
                 try:
                     return await process_address(session, addr, eth_usd, lookback_days, EXCHANGE_ADDRESSES, deep=deep)
-                except Exception:
+                except Exception as e:
+                    print(f"WORKER ERROR for {addr[:10]}...: {e}")
                     return None
 
         tasks = [worker(a) for a in addrs]
+        print(f"WORK: launching {len(tasks)} workers with concurrency={concurrency}")
+
         for fut in asyncio.as_completed(tasks):
             r = await fut
-            if r and (r["eth_usd_value"] or 0) >= usd_threshold:
+            processed += 1
+            if r and (r.get("eth_usd_value") or 0) >= usd_threshold:
                 results.append(r)
             elif r is None:
                 failed += 1
+
+            if processed % 25 == 0 or processed == total:
+                elapsed = time.time() - start
+                print(f"PROGRESS: processed={processed}/{total} matches={len(results)} failed={failed} elapsed={elapsed:.1f}s")
 
         if not results:
             print("No results above threshold.")
@@ -301,6 +338,15 @@ def main():
         except Exception:
             print("Could not fetch ETH price; set --eth_usd manually")
             return
+
+    # immediate startup log so Actions shows the process started
+    print("START: fetch_candidates.py", {
+        "limit": args.limit,
+        "usd_threshold": args.usd_threshold,
+        "concurrency": args.concurrency,
+        "fast": args.fast,
+        "eth_usd": eth_usd is not None
+    })
 
     asyncio.run(run_all(limit=args.limit, lookback_days=args.tx_lookback_days,
                         usd_threshold=args.usd_threshold, eth_usd=eth_usd,
