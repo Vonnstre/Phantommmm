@@ -33,28 +33,50 @@ HEADERS = {
 
 
 async def fetch_json(session, url, method='GET', json=None, headers=None, timeout=20, retries=3, backoff=0.6):
+    """
+    Generic JSON fetch with retries, handles 4xx responses by returning None,
+    and honors Retry-After for 429 where possible.
+    """
     for attempt in range(retries):
         try:
             if method == 'GET':
                 async with session.get(url, timeout=timeout, headers=headers) as r:
                     if r.status == 200:
                         return await r.json()
-                    # return None on 4xx/5xx so caller can act
+                    if r.status == 429:
+                        ra = r.headers.get("Retry-After")
+                        wait = float(ra) if ra and ra.isdigit() else backoff * (2 ** attempt)
+                        await asyncio.sleep(wait)
+                        continue
+                    # return None for 4xx/5xx so caller can act
                     if 400 <= r.status < 500:
                         return None
             else:
                 async with session.post(url, json=json, timeout=timeout, headers=headers) as r:
                     if r.status == 200:
                         return await r.json()
+                    if r.status == 429:
+                        ra = r.headers.get("Retry-After")
+                        wait = float(ra) if ra and ra.isdigit() else backoff * (2 ** attempt)
+                        await asyncio.sleep(wait)
+                        continue
                     if 400 <= r.status < 500:
                         return None
-        except Exception as e:
-            # transient errors will retry
-            await asyncio.sleep(backoff * (2 ** attempt))
+        except asyncio.TimeoutError:
+            # transient network timeout -> retry
+            pass
+        except Exception:
+            # other transient errors -> retry
+            pass
+        await asyncio.sleep(backoff * (2 ** attempt))
     return None
 
 
 async def scrape_top_addresses(session, limit, concurrency=3):
+    """
+    Scrape Etherscan /accounts/<page> pages for addresses until we have `limit`.
+    Return deduped list preserving order. If Etherscan blocks or returns non-200, stop early.
+    """
     addresses = []
     page = 1
     sem = asyncio.Semaphore(concurrency)
@@ -80,6 +102,7 @@ async def scrape_top_addresses(session, limit, concurrency=3):
             start = idx + len('/address/')
             addr = text[start:start + 42]
             if addr.startswith('0x') and len(addr) >= 42:
+                # sanitize
                 addr = addr.split('"')[0].split('<')[0].strip().lower()
                 addresses.append(addr)
                 found_this_page += 1
@@ -89,6 +112,7 @@ async def scrape_top_addresses(session, limit, concurrency=3):
 
         print(f"SCRAPE: page {page} done, found {found_this_page} addresses (total so far: {len(addresses)})")
         page += 1
+        # polite delay to reduce risk of being blocked
         await asyncio.sleep(0.45)
 
     # dedupe preserve order
@@ -118,22 +142,22 @@ async def get_balance_rpc(session, address):
 
 async def fetch_ethplorer(session, address):
     url = ETHPLORER_ENDPOINT.format(address)
-    # ethplorer can 429: let fetch_json handle retries, caller can backoff if many 429s come back as None
     return await fetch_json(session, url, retries=4, backoff=0.6)
 
 
 async def process_address(session, address, eth_usd, lookback_days, exchange_set, deep=True):
-    # perform both calls concurrently
+    # perform both calls concurrently and return the structured candidate dict
     tasks = [get_balance_rpc(session, address)]
     if deep:
         tasks.append(fetch_ethplorer(session, address))
     else:
         tasks.append(asyncio.sleep(0, result=None))
+
     bal_rpc, ethplorer = await asyncio.gather(*tasks)
 
     now = datetime.utcnow()
     eth_balance = bal_rpc or 0.0
-    eth_usd_value = eth_balance * eth_usd if eth_usd else None
+    eth_usd_value = eth_balance * eth_usd if eth_usd is not None else None
 
     distinct_tokens = 0
     total_in_tokens = 0.0
@@ -232,7 +256,7 @@ async def process_address(session, address, eth_usd, lookback_days, exchange_set
     return {
         "address": address,
         "eth_balance": round(eth_balance, 12),
-        "eth_usd_value": round((eth_balance * (eth_usd or 0)), 8) if eth_usd else None,
+        "eth_usd_value": round((eth_balance * (eth_usd or 0)), 8) if eth_usd is not None else None,
         "last_tx_ts": last_tx_dt,
         "days_since_last_tx": days_since_last,
         "tx_count_30d": tx_count_30,
@@ -323,21 +347,34 @@ def main():
     p.add_argument("--limit", type=int, default=200)
     p.add_argument("--tx_lookback_days", type=int, default=90)
     p.add_argument("--usd_threshold", type=float, default=10000)
-    p.add_argument("--eth_usd", type=float, default=None)
+    p.add_argument("--eth_usd", type=float, default=None, help="Override ETH/USD (float) to avoid remote fetch")
     p.add_argument("--concurrency", type=int, default=6)
     p.add_argument("--out", default="outputs/whale_candidates_raw.csv")
-    p.add_argument("--fast", action="store_true")
-    p.add_argument("--addresses_file", default=None)
+    p.add_argument("--fast", action="store_true", help="If set, skip Ethplorer deep per-address calls")
+    p.add_argument("--addresses_file", default=None, help="Optional: path with one address per line (skips scraping)")
     args = p.parse_args()
 
     import requests
+
     eth_usd = args.eth_usd
-    if not eth_usd:
-        try:
-            eth_usd = requests.get(COINGECKO_SIMPLE, timeout=10).json()["ethereum"]["usd"]
-        except Exception:
-            print("Could not fetch ETH price; set --eth_usd manually")
-            return
+    if eth_usd is None:
+        # try fetch coinGecko with retries
+        ok = False
+        for attempt in range(3):
+            try:
+                resp = requests.get(COINGECKO_SIMPLE, timeout=10)
+                if resp.status_code == 200:
+                    eth_usd = resp.json().get("ethereum", {}).get("usd")
+                    if eth_usd:
+                        ok = True
+                        break
+            except Exception:
+                pass
+            time.sleep(1 + attempt)
+        if not ok:
+            print("ERROR: could not fetch ETH price from CoinGecko and --eth_usd not provided.")
+            print("Please re-run with --eth_usd <price> (e.g. --eth_usd 1840.23)")
+            sys.exit(1)
 
     # immediate startup log so Actions shows the process started
     print("START: fetch_candidates.py", {
@@ -345,7 +382,7 @@ def main():
         "usd_threshold": args.usd_threshold,
         "concurrency": args.concurrency,
         "fast": args.fast,
-        "eth_usd": eth_usd is not None
+        "eth_usd": eth_usd
     })
 
     asyncio.run(run_all(limit=args.limit, lookback_days=args.tx_lookback_days,
