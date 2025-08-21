@@ -21,7 +21,11 @@ async def fetch_json(session, url, retries=4, backoff=0.8):
             async with session.get(url, timeout=30) as r:
                 if r.status == 200:
                     return await r.json()
-                # backoff on non-200
+                if r.status == 429:
+                    ra = r.headers.get("Retry-After")
+                    wait = float(ra) if ra and ra.isdigit() else backoff * (2 ** i)
+                    await asyncio.sleep(wait)
+                    continue
                 await asyncio.sleep(backoff * (2 ** i))
         except Exception:
             await asyncio.sleep(backoff * (2 ** i))
@@ -70,7 +74,7 @@ async def run_all(eth_usd, concurrency, top_file, out_path):
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
 
     connector = aiohttp.TCPConnector(limit=max(4, concurrency*2), force_close=True)
-    timeout = aiohttp.ClientTimeout(total=60)
+    timeout = aiohttp.ClientTimeout(total=90)
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         sem = asyncio.Semaphore(concurrency)
         results = []
@@ -83,6 +87,7 @@ async def run_all(eth_usd, concurrency, top_file, out_path):
 
         tasks = [worker(a) for a in addrs]
         print(f"DEEP: launching {len(tasks)} tasks with concurrency={concurrency}")
+        # gather concurrently
         await asyncio.gather(*tasks)
 
     with open(out_path, 'w', newline='') as f:
@@ -104,12 +109,17 @@ def main():
 
     import requests
     eth_usd = args.eth_usd
-    if not eth_usd:
+    if eth_usd is None:
         try:
-            eth_usd = requests.get(COINGECKO_SIMPLE, timeout=10).json()["ethereum"]["usd"]
+            resp = requests.get(COINGECKO_SIMPLE, timeout=10)
+            if resp.status_code == 200:
+                eth_usd = resp.json().get("ethereum", {}).get("usd")
         except Exception:
-            print("Could not fetch ETH price; set --eth_usd manually")
-            return
+            eth_usd = None
+
+    if eth_usd is None:
+        print("Could not fetch ETH price; set --eth_usd manually")
+        sys.exit(1)
 
     asyncio.run(run_all(eth_usd=eth_usd, concurrency=args.concurrency,
                         top_file=args.top_file, out_path=args.out))
