@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
 merge_deep_with_raw.py
+
 Join deep CSV back into raw CSV producing merged outputs.
 """
+
 import csv
 import os
 import argparse
-import sys
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -33,7 +35,7 @@ def main():
         rr = csv.DictReader(fr)
         out_fields = rr.fieldnames + [
             "eth_balance_deep","eth_usd_value_deep",
-            "total_token_balance_normalized_deep","top_tokens_deep"
+            "total_token_balance_normalized_deep","top_tokens_deep","protocols_hint"
         ]
         w = csv.DictWriter(fw, fieldnames=out_fields)
         w.writeheader()
@@ -45,9 +47,11 @@ def main():
             out["eth_usd_value_deep"] = d.get("eth_usd_value_deep","")
             out["total_token_balance_normalized_deep"] = d.get("total_token_balance_normalized_deep","")
             out["top_tokens_deep"] = d.get("top_tokens_deep","")
+            out["protocols_hint"] = d.get("protocols_hint","")
             w.writerow(out)
 
     print("WROTE merged file:", OUT)
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     main()
