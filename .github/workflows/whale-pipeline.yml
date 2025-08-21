@@ -3,30 +3,34 @@ name: Whales Pipeline
 on:
   workflow_dispatch:
     inputs:
+      per_token:
+        description: 'Holders per token for candidate builder'
+        required: true
+        default: '500'
       limit:
-        description: "Number of addresses to consider (fast pass)"
+        description: 'Number of addresses to consider (fetch limit)'
         required: true
-        default: "3000"
+        default: '10000'
       usd_threshold:
-        description: "Filter wallets by min USD value"
+        description: 'Filter wallets by min USD value'
         required: true
-        default: "10000"
+        default: '5000'
       eth_usd:
-        description: "Override ETH/USD (blank = fetch from Coingecko)"
+        description: 'Override ETH/USD price (leave blank to fetch)'
         required: false
-        default: ""
+        default: ''
       concurrency_fast:
-        description: "Concurrency for fast pass"
+        description: 'Concurrency for fast pass'
         required: true
-        default: "8"
+        default: '12'
       run_deep:
-        description: "Run deep-enrichment on top 500? (true/false)"
+        description: 'Run deep-enrichment on top 500? (true/false)'
         required: true
-        default: "true"
+        default: 'true'
       concurrency_deep:
-        description: "Concurrency for deep pass"
+        description: 'Concurrency for deep pass'
         required: true
-        default: "4"
+        default: '4'
 
 jobs:
   run:
@@ -38,28 +42,37 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Fast pass - candidates
+      - name: Build candidates from holders
+        run: |
+          mkdir -p outputs
+          python scripts/build_candidates_from_holders.py \
+            --per_token ${{ inputs.per_token }} \
+            --concurrency 4 \
+            --out outputs/candidates_from_holders.txt
+
+      - name: Fast pass - fetch candidates
         env:
           ETH_USD: ${{ inputs.eth_usd }}
-          PYTHONUNBUFFERED: '1'
         run: |
           mkdir -p outputs
           if [ -z "$ETH_USD" ]; then
-            python -u scripts/fetch_candidates.py \
+            python scripts/fetch_candidates.py \
+              --addresses_file outputs/candidates_from_holders.txt \
               --limit ${{ inputs.limit }} \
               --usd_threshold ${{ inputs.usd_threshold }} \
               --concurrency ${{ inputs.concurrency_fast }} \
               --out outputs/whale_candidates_raw.csv \
               --fast
           else
-            python -u scripts/fetch_candidates.py \
+            python scripts/fetch_candidates.py \
+              --addresses_file outputs/candidates_from_holders.txt \
               --limit ${{ inputs.limit }} \
               --usd_threshold ${{ inputs.usd_threshold }} \
               --concurrency ${{ inputs.concurrency_fast }} \
@@ -78,12 +91,12 @@ jobs:
           ETH_USD: ${{ inputs.eth_usd }}
         run: |
           if [ -z "$ETH_USD" ]; then
-            python -u scripts/deep_enrich_top.py \
+            python scripts/deep_enrich_top.py \
               --top_file outputs/top500_for_deep.txt \
               --out outputs/whale_candidates_deep.csv \
               --concurrency ${{ inputs.concurrency_deep }}
           else
-            python -u scripts/deep_enrich_top.py \
+            python scripts/deep_enrich_top.py \
               --top_file outputs/top500_for_deep.txt \
               --out outputs/whale_candidates_deep.csv \
               --concurrency ${{ inputs.concurrency_deep }} \
