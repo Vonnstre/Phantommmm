@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
 finalize_sqlite.py
-Take raw CSV (raw or merged), compute final scoring view using in-memory sqlite,
-export final_whales.csv, redacted_top10.csv, top500_for_deep.txt, README.txt and final_package.zip.
+
+Reads raw (or merged) CSV and produces final_whales.csv, redacted_top10.csv, top500_for_deep.txt, README.txt and final_package.zip.
 """
+
 import sqlite3
 import csv
 import os
@@ -11,7 +12,7 @@ import zipfile
 import datetime
 import math
 import argparse
-import sys
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -37,21 +38,19 @@ def main():
     con = sqlite3.connect(":memory:")
     cur = con.cursor()
 
-    # helpers
     cur.execute("PRAGMA journal_mode=OFF;")
     con.create_function("LOG10", 1, lambda x: math.log10(float(x)) if x is not None and float(x) > 0 else 0.0)
 
-    # create raw table
     cur.execute("""
         CREATE TABLE raw(
-            address TEXT, eth_balance TEXT, eth_usd_value TEXT, last_tx_ts TEXT,
+            address TEXT, eth_balance TEXT, eth_usd_value TEXT, balance_tier TEXT, last_tx_ts TEXT,
             days_since_last_tx TEXT, tx_count_30d TEXT, tx_count_90d TEXT, tx_count_365d TEXT,
             token_actions_30d TEXT, token_actions_90d TEXT, distinct_tokens_ever TEXT,
             recv_from_exchange_count_lookback TEXT, send_to_exchange_count_lookback TEXT,
             is_contract TEXT, total_in_tokens_normalized TEXT, total_out_tokens_normalized TEXT,
             top_tokens TEXT, lead_score_candidate TEXT,
             eth_balance_deep TEXT, eth_usd_value_deep TEXT,
-            total_token_balance_normalized_deep TEXT, top_tokens_deep TEXT
+            total_token_balance_normalized_deep TEXT, top_tokens_deep TEXT, protocols_hint TEXT
         );
     """)
 
@@ -63,6 +62,7 @@ def main():
                 r.get("address",""),
                 r.get("eth_balance",""),
                 r.get("eth_usd_value",""),
+                r.get("balance_tier",""),
                 r.get("last_tx_ts",""),
                 r.get("days_since_last_tx",""),
                 r.get("tx_count_30d",""),
@@ -82,20 +82,18 @@ def main():
                 r.get("eth_usd_value_deep",""),
                 r.get("total_token_balance_normalized_deep",""),
                 r.get("top_tokens_deep",""),
+                r.get("protocols_hint",""),
             ))
-        if not rows:
-            print("ERROR: input CSV has no rows.")
-            raise SystemExit(1)
-        cur.executemany("INSERT INTO raw VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+        cur.executemany("INSERT INTO raw VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
         con.commit()
 
-    # final view with scoring (reuse same formula as producer)
     cur.execute(f"""
         CREATE VIEW final AS
         SELECT
           address,
           CAST(eth_balance AS REAL) AS eth_balance,
           CAST(eth_usd_value AS REAL) AS eth_usd_value,
+          balance_tier,
           last_tx_ts,
           COALESCE(CAST(days_since_last_tx AS INTEGER), 99999) AS days_since_last_tx,
           COALESCE(CAST(tx_count_30d AS INTEGER),0) AS tx_count_30d,
@@ -114,6 +112,7 @@ def main():
           COALESCE(CAST(eth_usd_value_deep AS REAL), NULL) AS eth_usd_value_deep,
           COALESCE(CAST(total_token_balance_normalized_deep AS REAL), NULL) AS total_token_balance_normalized_deep,
           COALESCE(top_tokens_deep,'') AS top_tokens_deep,
+          COALESCE(protocols_hint,'') AS protocols_hint,
           CASE WHEN COALESCE(CAST(distinct_tokens_ever AS INTEGER),0)=0
                THEN 0.0
                ELSE (1.0 - (CAST(distinct_tokens_ever AS REAL) / 20.0))
@@ -132,7 +131,6 @@ def main():
         FROM raw;
     """)
 
-    # export final CSV
     cols = [d[1] for d in cur.execute("PRAGMA table_info('final')")]
     with open(OUT, 'w', newline='') as f:
         w = csv.writer(f)
@@ -140,24 +138,23 @@ def main():
         for row in cur.execute("SELECT * FROM final ORDER BY lead_score_candidate DESC"):
             w.writerow(row)
 
-    # redacted sample
     with open(SAMPLE, 'w', newline='') as f:
         w = csv.writer(f)
-        w.writerow(["addr_redacted","eth_usd_value","score","days_since_last_tx","top_tokens"])
+        w.writerow(["addr_redacted","eth_usd_value","score","days_since_last_tx","top_tokens","protocols_hint"])
         for row in cur.execute("""
             SELECT
               UPPER(substr(address,1,8) || '...' || substr(address, length(address)-6, 6)) AS addr_redacted,
               ROUND(eth_usd_value,2),
               ROUND(lead_score_candidate,2),
               days_since_last_tx,
-              top_tokens
+              top_tokens,
+              protocols_hint
             FROM final
             ORDER BY lead_score_candidate DESC
             LIMIT 10
         """):
             w.writerow(row)
 
-    # top 500 list
     total = cur.execute("SELECT COUNT(*) FROM final").fetchone()[0]
     take = min(500, total)
     with open(TOP_FOR_DEEP, 'w') as f:
@@ -168,23 +165,8 @@ def main():
         """):
             f.write(addr + "\n")
 
-    # README + ZIP
-    readme = f"""Product: Whale Candidates CSV (one-off)
-Run ID: {RUN_ID}
-Produced At: {PRODUCED_AT}
+    readme = f"""Product: Whale Candidates CSV (one-off)\nRun ID: {RUN_ID}\nProduced At: {PRODUCED_AT}\n\nFiles:\n - final_whales.csv : full enriched list ordered by lead_score_candidate\n - redacted_top10.csv : redacted sample for outreach (addresses masked)\n - top500_for_deep.txt : addresses recommended for deep enrichment pass\n\nColumns: address, eth_balance, eth_usd_value, balance_tier, last_tx_ts, days_since_last_tx, tx_count_30d, tx_count_90d, tx_count_365d, token_actions_30d, token_actions_90d, distinct_tokens_ever, recv_from_exchange_count_lookback, send_to_exchange_count_lookback, is_contract, total_in_tokens_normalized, total_out_tokens_normalized, top_tokens, eth_balance_deep, eth_usd_value_deep, total_token_balance_normalized_deep, top_tokens_deep, protocols_hint, concentration_score, lead_score_candidate, run_id, produced_at\n\nScoring: size (log10 USD)*40 + capped activity + recency + exchange recv + net inflow + concentration bias.\n\nNotes:\n - Data sourced from public on-chain endpoints (Cloudflare RPC + Ethplorer free key).\n"""
 
-Files:
- - final_whales.csv : full enriched list ordered by lead_score_candidate
- - redacted_top10.csv : redacted sample for outreach (addresses masked)
- - top500_for_deep.txt : addresses recommended for deep enrichment pass
-
-Columns: address, eth_balance, eth_usd_value, last_tx_ts, days_since_last_tx, tx_count_30d, tx_count_90d, tx_count_365d, token_actions_30d, token_actions_90d, distinct_tokens_ever, recv_from_exchange_count_lookback, send_to_exchange_count_lookback, is_contract, total_in_tokens_normalized, total_out_tokens_normalized, top_tokens, eth_balance_deep, eth_usd_value_deep, total_token_balance_normalized_deep, top_tokens_deep, concentration_score, lead_score_candidate, run_id, produced_at
-
-Scoring: size (log10 USD)*40 + capped activity + recency + exchange recv + net inflow + concentration bias.
-
-Notes:
- - Data sourced from public on-chain endpoints (Cloudflare RPC + Ethplorer free key).
-"""
     with open(README, 'w') as f:
         f.write(readme)
 
@@ -197,5 +179,6 @@ Notes:
     print("WROTE:", OUT, SAMPLE, TOP_FOR_DEEP, README, ZIP)
     con.close()
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     main()
