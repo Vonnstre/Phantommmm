@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """
 finalize_sqlite.py
-Takes raw CSV (raw or merged), computes final scoring view using in-memory sqlite,
-exports final_whales.csv, redacted_top10.csv, top500_for_deep.txt, README.txt and final_package.zip.
+Take raw CSV (raw or merged), compute final scoring view using in-memory sqlite,
+export final_whales.csv, redacted_top10.csv, top500_for_deep.txt, README.txt and final_package.zip.
 """
-
 import sqlite3
 import csv
 import os
 import zipfile
-from datetime import datetime
+import datetime
 import math
 import argparse
 import sys
@@ -27,8 +26,8 @@ def main():
     README = os.path.join(BASE, "README.txt")
     ZIP = os.path.join(BASE, "final_package.zip")
     TOP_FOR_DEEP = os.path.join(BASE, "top500_for_deep.txt")
-    RUN_ID = "run_" + datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    PRODUCED_AT = datetime.utcnow().isoformat() + "Z"
+    RUN_ID = "run_" + datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    PRODUCED_AT = datetime.datetime.utcnow().isoformat() + "Z"
 
     os.makedirs(BASE, exist_ok=True)
     if not os.path.exists(RAW):
@@ -84,6 +83,9 @@ def main():
                 r.get("total_token_balance_normalized_deep",""),
                 r.get("top_tokens_deep",""),
             ))
+        if not rows:
+            print("ERROR: input CSV has no rows.")
+            raise SystemExit(1)
         cur.executemany("INSERT INTO raw VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
         con.commit()
 
