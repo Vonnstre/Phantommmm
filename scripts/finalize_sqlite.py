@@ -9,7 +9,7 @@ import sqlite3
 import csv
 import os
 import zipfile
-import datetime
+from datetime import datetime
 import math
 import argparse
 import sys
@@ -27,13 +27,12 @@ def main():
     README = os.path.join(BASE, "README.txt")
     ZIP = os.path.join(BASE, "final_package.zip")
     TOP_FOR_DEEP = os.path.join(BASE, "top500_for_deep.txt")
-    RUN_ID = "run_" + datetime.datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    PRODUCED_AT = datetime.datetime.datetime.utcnow().isoformat() + "Z"
+    RUN_ID = "run_" + datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    PRODUCED_AT = datetime.utcnow().isoformat() + "Z"
 
     os.makedirs(BASE, exist_ok=True)
     if not os.path.exists(RAW):
         print("ERROR: raw CSV not found:", RAW)
-        # don't crash with cryptic trace in Actions, exit non-zero so workflow fails predictably
         raise SystemExit(1)
 
     con = sqlite3.connect(":memory:")
