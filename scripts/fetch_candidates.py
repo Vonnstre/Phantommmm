@@ -2,10 +2,15 @@
 """
 fetch_candidates.py
 
-Fast pass: given a list of addresses (or scraped list), call Cloudflare RPC for balances
-and optionally Ethplorer for light enrich. Produces outputs/whale_candidates_raw.csv
-"""
+Default behavior:
+ - If --addresses_file provided: read addresses from that file.
+ - Else: scrape Etherscan /accounts/<page> pages until `--limit` addresses found.
 
+Fast mode (--fast): only eth_getBalance via Cloudflare RPC (cheap & fast) — use to scan many addresses.
+Deep mode (default off with --fast): also call Ethplorer per-address (may be throttled).
+
+Stream CSV rows as they pass --usd_threshold to reduce memory usage.
+"""
 import asyncio
 import aiohttp
 import argparse
@@ -15,7 +20,9 @@ import csv
 import os
 import sys
 from datetime import datetime, timedelta
+from typing import Optional
 
+ETHERSCAN_ACCOUNTS_PAGE = "https://etherscan.io/accounts/{}"
 ETHPLORER_ENDPOINT = "https://api.ethplorer.io/getAddressInfo/{}?apiKey=freekey"
 CLOUDFLARE_RPC = "https://cloudflare-eth.com"
 COINGECKO_SIMPLE = "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd"
@@ -26,13 +33,15 @@ EXCHANGE_ADDRESSES = {
     "0xdc76cd25977e0a5ae17155770273ad58648900d3",
 }
 
-HEADERS = {"User-Agent": "Mozilla/5.0"}
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; whale-fetcher/1.0)"}
 
 
-async def fetch_json(session, url, method='GET', json=None, headers=None, timeout=20, retries=3, backoff=0.6):
+async def fetch_json(session: aiohttp.ClientSession, url: str, method: str = 'GET',
+                     json: Optional[dict] = None, headers: Optional[dict] = None,
+                     timeout: int = 20, retries: int = 3, backoff: float = 0.6):
     for attempt in range(retries):
         try:
-            if method == 'GET':
+            if method.upper() == 'GET':
                 async with session.get(url, timeout=timeout, headers=headers) as r:
                     if r.status == 200:
                         return await r.json()
@@ -41,6 +50,7 @@ async def fetch_json(session, url, method='GET', json=None, headers=None, timeou
                         wait = float(ra) if ra and ra.isdigit() else backoff * (2 ** attempt)
                         await asyncio.sleep(wait)
                         continue
+                    # client error -> return None (not retrying further)
                     if 400 <= r.status < 500:
                         return None
             else:
@@ -62,7 +72,62 @@ async def fetch_json(session, url, method='GET', json=None, headers=None, timeou
     return None
 
 
-async def get_balance_rpc(session, address):
+async def scrape_top_addresses(session: aiohttp.ClientSession, limit: int, concurrency: int = 3):
+    """
+    Scrape Etherscan /accounts/<page> pages to collect addresses until `limit`.
+    Returns deduped list preserving order. Stops early if Etherscan returns non-200.
+    """
+    addresses = []
+    page = 1
+    sem = asyncio.Semaphore(concurrency)
+    while len(addresses) < limit:
+        url = ETHERSCAN_ACCOUNTS_PAGE.format(page)
+        async with sem:
+            try:
+                async with session.get(url, headers=HEADERS, timeout=20) as r:
+                    if r.status != 200:
+                        print(f"SCRAPE: page {page} returned status {r.status} — stopping scrape.")
+                        break
+                    text = await r.text()
+            except Exception as e:
+                print(f"SCRAPE: page {page} fetch error: {e} — stopping.")
+                break
+
+        idx = 0
+        found_this = 0
+        while True:
+            idx = text.find('/address/', idx)
+            if idx == -1:
+                break
+            start = idx + len('/address/')
+            addr = text[start:start + 42]
+            if addr.startswith('0x') and len(addr) >= 42:
+                addr = addr.split('"')[0].split('<')[0].strip().lower()
+                addresses.append(addr)
+                found_this += 1
+                if len(addresses) >= limit:
+                    break
+            idx += 1
+
+        print(f"SCRAPE: page {page} found {found_this}; total so far {len(addresses)}")
+        page += 1
+        # polite delay so Etherscan doesn't block quickly
+        await asyncio.sleep(0.45)
+
+    # dedupe preserve order
+    seen = set()
+    out = []
+    for a in addresses:
+        if a not in seen:
+            seen.add(a)
+            out.append(a)
+            if len(out) >= limit:
+                break
+    print(f"SCRAPE: finished; returning {len(out)} addresses")
+    return out
+
+
+async def get_balance_rpc(session: aiohttp.ClientSession, address: str):
     payload = {"jsonrpc": "2.0", "id": 1, "method": "eth_getBalance", "params": [address, "latest"]}
     r = await fetch_json(session, CLOUDFLARE_RPC, method='POST', json=payload,
                          headers={"Content-Type": "application/json"}, retries=4)
@@ -74,12 +139,31 @@ async def get_balance_rpc(session, address):
         return None
 
 
-async def fetch_ethplorer(session, address):
+async def fetch_ethplorer(session: aiohttp.ClientSession, address: str):
     url = ETHPLORER_ENDPOINT.format(address)
     return await fetch_json(session, url, retries=4, backoff=0.6)
 
 
-async def process_address(session, address, eth_usd, lookback_days, exchange_set, deep=True):
+def balance_tier_label(usd_val: float):
+    try:
+        v = float(usd_val or 0)
+    except Exception:
+        return "unknown"
+    if v >= 10_000_000:
+        return ">=10M"
+    if v >= 1_000_000:
+        return ">=1M"
+    if v >= 100_000:
+        return ">=100k"
+    if v >= 10_000:
+        return ">=10k"
+    if v >= 1_000:
+        return ">=1k"
+    return "<1k"
+
+
+async def process_address(session: aiohttp.ClientSession, address: str, eth_usd: float,
+                          lookback_days: int, exchange_set: set, deep: bool = True):
     tasks = [get_balance_rpc(session, address)]
     if deep:
         tasks.append(fetch_ethplorer(session, address))
@@ -91,6 +175,7 @@ async def process_address(session, address, eth_usd, lookback_days, exchange_set
     eth_balance = bal_rpc or 0.0
     eth_usd_value = eth_balance * eth_usd if eth_usd is not None else None
 
+    # default fields
     distinct_tokens = 0
     total_in_tokens = 0.0
     total_out_tokens = 0.0
@@ -185,30 +270,11 @@ async def process_address(session, address, eth_usd, lookback_days, exchange_set
         + (concentration_score * 5)
     )
 
-    # balance tier label
-    tier = "<1k"
-    try:
-        v = (eth_usd_value or 0)
-        if v >= 10_000_000:
-            tier = ">=10M"
-        elif v >= 1_000_000:
-            tier = ">=1M"
-        elif v >= 100_000:
-            tier = ">=100k"
-        elif v >= 10_000:
-            tier = ">=10k"
-        elif v >= 1000:
-            tier = ">=1k"
-        else:
-            tier = "<1k"
-    except Exception:
-        tier = "unknown"
-
     return {
         "address": address,
         "eth_balance": round(eth_balance, 12),
         "eth_usd_value": round((eth_balance * (eth_usd or 0)), 8) if eth_usd is not None else None,
-        "balance_tier": tier,
+        "balance_tier": balance_tier_label(eth_balance * (eth_usd or 0)),
         "last_tx_ts": last_tx_dt,
         "days_since_last_tx": days_since_last,
         "tx_count_30d": tx_count_30,
@@ -227,12 +293,30 @@ async def process_address(session, address, eth_usd, lookback_days, exchange_set
     }
 
 
-async def run_all(limit, lookback_days, usd_threshold, eth_usd, concurrency, deep, out_file, addresses_file):
+async def run_all(limit: int, lookback_days: int, usd_threshold: float, eth_usd: float,
+                  concurrency: int, deep: bool, out_file: str, addresses_file: Optional[str]):
+
     start = time.time()
     os.makedirs(os.path.dirname(out_file) or ".", exist_ok=True)
     connector = aiohttp.TCPConnector(limit=max(8, concurrency * 2), force_close=True)
     timeout = aiohttp.ClientTimeout(total=90)
+
+    # CSV fields (include deep columns placeholders)
+    fieldnames = [
+        "address", "eth_balance", "eth_usd_value", "balance_tier",
+        "last_tx_ts", "days_since_last_tx",
+        "tx_count_30d", "tx_count_90d", "tx_count_365d",
+        "token_actions_30d", "token_actions_90d", "distinct_tokens_ever",
+        "recv_from_exchange_count_lookback", "send_to_exchange_count_lookback",
+        "is_contract", "total_in_tokens_normalized", "total_out_tokens_normalized",
+        "top_tokens", "lead_score_candidate"
+    ]
+
+    write_lock = asyncio.Lock()
+    total_written = 0
+
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+        # obtain address list
         if addresses_file:
             addrs = []
             with open(addresses_file, 'r') as fh:
@@ -240,20 +324,24 @@ async def run_all(limit, lookback_days, usd_threshold, eth_usd, concurrency, dee
                     a = line.strip().lower()
                     if a.startswith('0x'):
                         addrs.append(a)
-            print(f"LOADED: {len(addrs)} addresses from {addresses_file}")
+            print(f"LOADED {len(addrs)} addresses from {addresses_file}")
         else:
-            print("ERROR: No addresses_file provided. This pipeline expects a curated addresses file (from holders builder).")
-            return
+            print(f"SCRAPE: will scrape up to {limit} addresses from Etherscan accounts pages")
+            addrs = await scrape_top_addresses(session, limit, concurrency=max(2, concurrency // 3))
+            print(f"SCRAPE: scraped {len(addrs)} addresses")
 
         if not addrs:
-            print("No candidate addresses loaded; exiting.")
+            print("ERROR: No addresses available (scrape failed or file empty). Exiting.")
             return
 
         sem = asyncio.Semaphore(concurrency)
-        results = []
-        failed = 0
         processed = 0
         total = len(addrs)
+
+        # prepare output CSV (streaming)
+        f_out = open(out_file, 'w', newline='')
+        writer = csv.DictWriter(f_out, fieldnames=fieldnames)
+        writer.writeheader()
 
         async def worker(addr):
             async with sem:
@@ -264,49 +352,47 @@ async def run_all(limit, lookback_days, usd_threshold, eth_usd, concurrency, dee
                     return None
 
         tasks = [worker(a) for a in addrs[:limit]]
-        print(f"WORK: launching {len(tasks)} workers with concurrency={concurrency}")
+        print(f"WORK: launching {len(tasks)} tasks with concurrency={concurrency}")
 
-        for fut in asyncio.as_completed(tasks):
-            r = await fut
-            processed += 1
-            if r and (r.get("eth_usd_value") or 0) >= usd_threshold:
-                results.append(r)
-            elif r is None:
-                failed += 1
-
-            if processed % 50 == 0 or processed == total:
-                elapsed = time.time() - start
-                print(f"PROGRESS: processed={processed}/{total} matches={len(results)} failed={failed} elapsed={elapsed:.1f}s")
-
-        if not results:
-            print("No results above threshold.")
-            return
-
-        fieldnames = list(results[0].keys())
-        with open(out_file, 'w', newline='') as f:
-            w = csv.DictWriter(f, fieldnames=fieldnames)
-            w.writeheader()
-            for row in sorted(results, key=lambda x: x["lead_score_candidate"], reverse=True):
-                w.writerow(row)
+        try:
+            for fut in asyncio.as_completed(tasks):
+                r = await fut
+                processed += 1
+                if r is None:
+                    # failed to fetch this address
+                    if processed % 100 == 0:
+                        print(f"PROGRESS: processed={processed}/{total}")
+                    continue
+                # check USD threshold (eth_usd_value can be None if eth_usd unavailable)
+                val = r.get("eth_usd_value") or 0
+                if val >= usd_threshold:
+                    # stream-write the row
+                    async with write_lock:
+                        writer.writerow({k: r.get(k, "") for k in fieldnames})
+                        total_written += 1
+                if processed % 200 == 0 or processed == total:
+                    elapsed = time.time() - start
+                    print(f"PROGRESS: processed={processed}/{total} matches={total_written} elapsed={elapsed:.1f}s")
+        finally:
+            f_out.close()
 
         elapsed = time.time() - start
-        print(f"WROTE {out_file} rows={len(results)} failed={failed} time={elapsed:.1f}s")
+        print(f"WROTE {out_file} rows={total_written} processed={processed} time={elapsed:.1f}s")
 
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--limit", type=int, default=10000)
+    p.add_argument("--limit", type=int, default=10000, help="Maximum addresses to scan (default 10k). For fast scans you can set 100k+ but watch GH time.")
     p.add_argument("--tx_lookback_days", type=int, default=90)
     p.add_argument("--usd_threshold", type=float, default=10000)
     p.add_argument("--eth_usd", type=float, default=None, help="Override ETH/USD (float) to avoid remote fetch")
-    p.add_argument("--concurrency", type=int, default=6)
+    p.add_argument("--concurrency", type=int, default=12)
     p.add_argument("--out", default="outputs/whale_candidates_raw.csv")
-    p.add_argument("--fast", action="store_true", help="If set, skip Ethplorer deep per-address calls")
-    p.add_argument("--addresses_file", default=None, help="Path with one address per line (required)")
+    p.add_argument("--fast", action="store_true", help="If set, skip Ethplorer deep per-address calls (recommended for large scans)")
+    p.add_argument("--addresses_file", default=None, help="Optional: path with one address per line (if provided, will not scrape)")
     args = p.parse_args()
 
     import requests
-
     eth_usd = args.eth_usd
     if eth_usd is None:
         ok = False
@@ -322,10 +408,10 @@ def main():
                 pass
             time.sleep(1 + attempt)
         if not ok:
-            print("ERROR: could not fetch ETH price from CoinGecko and --eth_usd not provided.")
+            print("ERROR: could not fetch ETH price from CoinGecko and --eth_usd not provided. Use --eth_usd to set price and continue.")
             sys.exit(1)
 
-    print("START: fetch_candidates.py", {"limit": args.limit, "usd_threshold": args.usd_threshold, "concurrency": args.concurrency, "fast": args.fast, "eth_usd": eth_usd})
+    print("START:", {"limit": args.limit, "usd_threshold": args.usd_threshold, "concurrency": args.concurrency, "fast": args.fast, "eth_usd": eth_usd})
 
     asyncio.run(run_all(limit=args.limit, lookback_days=args.tx_lookback_days,
                         usd_threshold=args.usd_threshold, eth_usd=eth_usd,
