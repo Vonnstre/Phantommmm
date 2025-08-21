@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """
-deep_enrich_top.py
 Deep-enrich the top addresses listed in top500_for_deep.txt using Ethplorer freekey.
 """
-
 import asyncio
 import aiohttp
 import argparse
 import csv
 import os
 import sys
-from datetime import datetime
+import time
 
 ETHPLORER_ENDPOINT = "https://api.ethplorer.io/getAddressInfo/{}?apiKey=freekey"
 COINGECKO_SIMPLE = "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd"
@@ -74,7 +72,7 @@ async def run_all(eth_usd, concurrency, top_file, out_path):
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
 
     connector = aiohttp.TCPConnector(limit=max(4, concurrency*2), force_close=True)
-    timeout = aiohttp.ClientTimeout(total=90)
+    timeout = aiohttp.ClientTimeout(total=60)
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         sem = asyncio.Semaphore(concurrency)
         results = []
@@ -87,11 +85,11 @@ async def run_all(eth_usd, concurrency, top_file, out_path):
 
         tasks = [worker(a) for a in addrs]
         print(f"DEEP: launching {len(tasks)} tasks with concurrency={concurrency}")
-        # gather concurrently
         await asyncio.gather(*tasks)
 
     with open(out_path, 'w', newline='') as f:
-        fieldnames = ["address","eth_balance_deep","eth_usd_value_deep","total_token_balance_normalized_deep","top_tokens_deep"]
+        fieldnames = ["address","eth_balance_deep","eth_usd_value_deep",
+                      "total_token_balance_normalized_deep","top_tokens_deep"]
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         for r in results:
@@ -111,15 +109,10 @@ def main():
     eth_usd = args.eth_usd
     if eth_usd is None:
         try:
-            resp = requests.get(COINGECKO_SIMPLE, timeout=10)
-            if resp.status_code == 200:
-                eth_usd = resp.json().get("ethereum", {}).get("usd")
+            eth_usd = requests.get(COINGECKO_SIMPLE, timeout=10).json()["ethereum"]["usd"]
         except Exception:
+            print("Could not fetch ETH price; set --eth_usd manually (optional). Proceeding with eth_usd=None.")
             eth_usd = None
-
-    if eth_usd is None:
-        print("Could not fetch ETH price; set --eth_usd manually")
-        sys.exit(1)
 
     asyncio.run(run_all(eth_usd=eth_usd, concurrency=args.concurrency,
                         top_file=args.top_file, out_path=args.out))
