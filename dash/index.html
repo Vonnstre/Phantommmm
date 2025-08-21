@@ -1,0 +1,47 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Whale Candidates Dashboard</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:18px}
+    table{border-collapse:collapse;width:100%}
+    th,td{padding:8px;border:1px solid #ddd;text-align:left;font-size:13px}
+    th{background:#f3f3f3;position:sticky;top:0}
+    input.search{padding:8px;width:100%;margin-bottom:8px}
+  </style>
+</head>
+<body>
+  <h2>Whale Candidates — Dashboard</h2>
+  <p>This static dashboard reads <code>outputs/final_whales.csv</code> placed in the repo root (Actions artifact can be downloaded into outputs/ for preview).</p>
+  <input class="search" id="q" placeholder="Search address, token, protocol hint, tier..."/>
+  <div id="info"></div>
+  <div style="max-height:70vh;overflow:auto"><table id="tbl"><thead><tr id="hdr"></tr></thead><tbody id="body"></tbody></table></div>
+
+  <script>
+  async function loadCSV(path){
+    try{
+      const res = await fetch(path);
+      if(!res.ok) throw new Error('not ok');
+      const txt = await res.text();
+      return txt.split('\n').filter(Boolean).map(l=>l.split(','));
+    }catch(e){console.warn(e);return null}
+  }
+  function sanitizeCell(s){return (s||'').replace(/^"|"$/g,'')}
+  (async ()=>{
+    const dataRaw = await loadCSV('../outputs/final_whales.csv');
+    const info = document.getElementById('info');
+    if(!dataRaw){info.innerHTML='<b>final_whales.csv not found in outputs/ — place it there or download Actions artifact into outputs/</b>';return}
+    const header = dataRaw[0].map(h=>sanitizeCell(h));
+    const rows = dataRaw.slice(1).map(r=>r.map(c=>sanitizeCell(c)));
+    const hdr = document.getElementById('hdr');
+    header.forEach(h=>{const th=document.createElement('th');th.textContent=h;hdr.appendChild(th)});
+    const body = document.getElementById('body');
+    function render(filter){body.innerHTML='';let shown=0;rows.forEach(r=>{const rowStr=r.join(' ').toLowerCase();if(filter && rowStr.indexOf(filter)===-1) return;const tr=document.createElement('tr');r.slice(0,header.length).forEach(c=>{const td=document.createElement('td');td.textContent=c;tr.appendChild(td)});body.appendChild(tr);shown++});document.getElementById('info').innerText=`rows: ${rows.length} shown: ${shown}`}
+    render('');
+    document.getElementById('q').addEventListener('input',e=>render((e.target.value||'').toLowerCase()));
+  })();
+  </script>
+</body>
+</html>
