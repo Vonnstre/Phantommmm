@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """
-Deep-enrich the top addresses listed in top500_for_deep.txt using Ethplorer freekey.
+deep_enrich_top.py
+
+Deep-enrich top addresses listed in top500_for_deep.txt using Ethplorer freekey.
+Outputs a CSV with deep columns.
 """
+
 import asyncio
 import aiohttp
 import argparse
 import csv
 import os
 import sys
-import time
+from datetime import datetime
 
 ETHPLORER_ENDPOINT = "https://api.ethplorer.io/getAddressInfo/{}?apiKey=freekey"
 COINGECKO_SIMPLE = "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd"
+
 
 async def fetch_json(session, url, retries=4, backoff=0.8):
     for i in range(retries):
@@ -20,14 +25,15 @@ async def fetch_json(session, url, retries=4, backoff=0.8):
                 if r.status == 200:
                     return await r.json()
                 if r.status == 429:
-                    ra = r.headers.get("Retry-After")
+                    ra = r.headers.get('Retry-After')
                     wait = float(ra) if ra and ra.isdigit() else backoff * (2 ** i)
                     await asyncio.sleep(wait)
-                    continue
-                await asyncio.sleep(backoff * (2 ** i))
+                else:
+                    await asyncio.sleep(backoff * (2 ** i))
         except Exception:
             await asyncio.sleep(backoff * (2 ** i))
     return None
+
 
 async def enrich_address(session, addr, eth_usd):
     url = ETHPLORER_ENDPOINT.format(addr)
@@ -53,16 +59,30 @@ async def enrich_address(session, addr, eth_usd):
             top_tokens.append((ti.get('symbol') or ti.get('name') or ti.get('address'), normalized))
         except Exception:
             pass
-    top_tokens = sorted(top_tokens, key=lambda x: -abs(x[1]))[:8]
+    top_tokens = sorted(top_tokens, key=lambda x: -abs(x[1]))[:12]
     top_tokens_str = ";".join([f"{t[0]}:{t[1]:.6g}" for t in top_tokens])
+
+    # simple protocol hints derived from token symbols
+    protocols_hint = []
+    for s, amt in top_tokens[:8]:
+        sym = (s or '').lower()
+        if 'usdc' in sym or 'usdt' in sym:
+            protocols_hint.append('stablecoin')
+        if 'weth' in sym or 'eth' == sym:
+            protocols_hint.append('liquid-eth')
+        if 'st' in sym and 'eth' in sym:
+            protocols_hint.append('staking')
+    protocols_hint = list(dict.fromkeys(protocols_hint))
 
     return {
         "address": addr,
         "eth_balance_deep": round(eth_balance, 12),
         "eth_usd_value_deep": round(eth_usd_value, 8),
         "total_token_balance_normalized_deep": round(total_token_balance_normalized, 6),
-        "top_tokens_deep": top_tokens_str
+        "top_tokens_deep": top_tokens_str,
+        "protocols_hint": ",".join(protocols_hint)
     }
+
 
 async def run_all(eth_usd, concurrency, top_file, out_path):
     if not os.path.exists(top_file):
@@ -88,14 +108,14 @@ async def run_all(eth_usd, concurrency, top_file, out_path):
         await asyncio.gather(*tasks)
 
     with open(out_path, 'w', newline='') as f:
-        fieldnames = ["address","eth_balance_deep","eth_usd_value_deep",
-                      "total_token_balance_normalized_deep","top_tokens_deep"]
+        fieldnames = ["address","eth_balance_deep","eth_usd_value_deep","total_token_balance_normalized_deep","top_tokens_deep","protocols_hint"]
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         for r in results:
             w.writerow(r)
 
     print("WROTE deep file:", out_path, "rows:", len(results))
+
 
 def main():
     p = argparse.ArgumentParser()
@@ -107,15 +127,15 @@ def main():
 
     import requests
     eth_usd = args.eth_usd
-    if eth_usd is None:
+    if not eth_usd:
         try:
             eth_usd = requests.get(COINGECKO_SIMPLE, timeout=10).json()["ethereum"]["usd"]
         except Exception:
-            print("Could not fetch ETH price; set --eth_usd manually (optional). Proceeding with eth_usd=None.")
-            eth_usd = None
+            print("Could not fetch ETH price; set --eth_usd manually")
+            return
 
-    asyncio.run(run_all(eth_usd=eth_usd, concurrency=args.concurrency,
-                        top_file=args.top_file, out_path=args.out))
+    asyncio.run(run_all(eth_usd=eth_usd, concurrency=args.concurrency, top_file=args.top_file, out_path=args.out))
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     main()
